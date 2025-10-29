@@ -4,16 +4,18 @@ An AI-powered TSV (Tab-Separated Values) editor that lets you modify spreadsheet
 
 ## What is tsvd?
 
-tsvd is an interactive command-line tool that combines the power of Claude AI with spreadsheet editing. Instead of manually editing TSV files or writing complex scripts, you can simply describe what you want to do in plain English, and Claude will make the changes for you.
+tsvd is an interactive command-line tool to provide a Claude-Code like editing experience for spreadsheets in tsv format.
+
+The harness improves reliability of AI when working on tabular data:
+- Clearer column / row labelling to get cell references right
+- Makes sure AI assumes the spreadsheet has to be compatible with the featureset of Google Sheets
+- Nudges Claude not to break spreadsheets when working with data in non-US locales
 
 ## Features
 
-- 🤖 **Natural Language Editing**: Describe changes in plain English
-- 📊 **Formula Support**: Full Excel-style formula support (SUM, AVERAGE, IF, VLOOKUP, etc.)
-- 🔍 **Smart Diff Viewer**: See exactly what will change before applying
-- 💬 **Interactive Conversation**: Iterate on changes through a conversational interface
-- ✅ **Safe by Default**: Review and approve changes before they're saved
-- 🔄 **Undo Support**: Revert to original state on exit if needed
+- 💬 **Interactive Conversation**: Iterate on changes by prompting through a conversational interface
+- 🔍 **Diff Viewer**: See exactly what will change before applying
+- ✅ **Safe by Default**: Review and approve changes before they're saved, CTRL+C any time
 
 ## Installation
 
@@ -62,6 +64,12 @@ Options:
   --help, -h             Show help message
 ```
 
+## Requirements
+
+- **Deno**: The script runs on Deno (specified in shebang)
+- **Permissions**: Requires `--allow-read`, `--allow-write`, `--allow-env`, and `--allow-net`
+- **API Key**: Valid Anthropic API key in `ANTHROPIC_API_KEY` environment variable
+
 ### Examples
 
 ```bash
@@ -69,7 +77,7 @@ Options:
 tsvd sales.tsv
 
 # Use a specific Claude model
-tsvd --model claude-opus-4-20250514 data.tsv
+tsvd --model claude-opus-4-1-20250805 data.tsv
 
 # Enable debug mode
 tsvd --debug data.tsv
@@ -85,11 +93,9 @@ Loaded sales.tsv (150 rows, 5 columns)
 user › Add a new column called "Total" that sums Price and Tax
 ```
 
-Claude will:
-1. Show its thinking process (if applicable)
-2. Propose the changes
-3. Display a colored diff showing what will change
-4. Ask for your confirmation before saving
+`tsvd` will:
+1. Propose the changes and display a colored diff showing what will change
+2. Ask for your confirmation before saving
 
 To exit, press Enter on an empty line or press Ctrl+C.
 
@@ -119,29 +125,6 @@ user › Convert all email addresses to lowercase
 ```
 user › Add a column with =SUM(A2:A10) at the bottom
 ```
-
-## Formula Syntax
-
-tsvd supports Excel-style formulas with one important difference: **parameters are separated by semicolons (`;`) instead of commas (`,`)**:
-
-```
-✅ Correct:  =SUM(A1;A2;A3)
-❌ Wrong:    =SUM(A1,A2,A3)
-
-✅ Correct:  =IF(A1>100;"High";"Low")
-❌ Wrong:    =IF(A1>100,"High","Low")
-```
-
-This semicolon syntax is used in some locales (like European Google Sheets) to avoid conflicts with comma decimal separators.
-
-### Supported Functions
-
-- Arithmetic: `SUM`, `AVERAGE`, `MIN`, `MAX`
-- Logic: `IF`, `AND`, `OR`, `NOT`
-- Lookup: `VLOOKUP`, `HLOOKUP`, `INDEX`, `MATCH`
-- Text: `CONCATENATE`, `LEFT`, `RIGHT`, `MID`, `LEN`
-- Cell references: `A1`, `B2`, ranges like `A1:A10`
-- And more...
 
 ## Limits
 
@@ -173,34 +156,3 @@ Enable debug mode with `--debug` or `-d` to see:
 ```bash
 tsvd --debug data.tsv
 ```
-
-## Requirements
-
-- **Deno**: The script runs on Deno (specified in shebang)
-- **Permissions**: Requires `--allow-read`, `--allow-write`, `--allow-env`, and `--allow-net`
-- **API Key**: Valid Anthropic API key in `ANTHROPIC_API_KEY` environment variable
-
-## Troubleshooting
-
-### "ANTHROPIC_API_KEY environment variable not set"
-
-Set your API key:
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### "Table has X columns, exceeds maximum of 26"
-
-Your TSV has too many columns. Consider splitting it into multiple files or removing unnecessary columns manually first.
-
-### "String appears N times. Please be more specific or use replace_all"
-
-Claude tried to use `str_replace` but the text appears multiple times. Ask Claude to be more specific about which occurrence to change.
-
-## License
-
-[Add your license here]
-
-## Contributing
-
-[Add contribution guidelines here]
