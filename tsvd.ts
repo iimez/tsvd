@@ -1,670 +1,728 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env --allow-net
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env --allow-net --allow-run
 
-import Anthropic from "npm:@anthropic-ai/sdk@0.68.0";
-import { Confirm, Input } from "jsr:@cliffy/prompt@1.0.0-rc.8";
-import { colors } from "jsr:@cliffy/ansi@1.0.0-rc.8/colors";
+/**
+ * TSVD - TSV/Markdown Spreadsheet Editor with AI assistance
+ *
+ * Usage:
+ *   tsvd.ts [options] [file]
+ *
+ * Options:
+ *   -d, --debug                Enable debug output
+ *   -m, --model <model>        Model to use (defaults: anthropic=claude-sonnet-4-5-20250929, openrouter=z-ai/glm-4.6:exacto)
+ *   -p, --provider <provider>  Provider: anthropic or openrouter (auto-detected from API keys)
+ *   --prompt <prompt>          Initial prompt to send to the model
+ *   -h, --help                 Show help
+ *   -V, --version              Show version
+ *
+ * Arguments:
+ *   [file]                     TSV file to edit (optional, will prompt if not provided)
+ *   -                          Read from stdin
+ *
+ * Examples:
+ *   # Use Anthropic Claude (auto-detected from API key)
+ *   ANTHROPIC_API_KEY=... deno run tsvd.ts myfile.tsv
+ *
+ *   # Use OpenRouter (auto-detected from API key)
+ *   OPENROUTER_API_KEY=... deno run tsvd.ts myfile.tsv
+ *
+ *   # Explicitly specify provider
+ *   OPENROUTER_API_KEY=... deno run tsvd.ts -p openrouter -m openai/gpt-4o myfile.tsv
+ *
+ *   # Pass an initial prompt
+ *   ANTHROPIC_API_KEY=... deno run tsvd.ts --prompt "Add a new column for shipping cost" myfile.tsv
+ *
+ *   # Read from stdin
+ *   cat data.tsv | ANTHROPIC_API_KEY=... deno run tsvd.ts -
+ *
+ * Note: Extended thinking is supported on both Anthropic and OpenRouter providers.
+ */
 
-const MAX_COLUMNS = 26;
-const MAX_ROWS = 1000;
-const DEFAULT_MODEL = "claude-sonnet-4-5-20250929";
+import { Command, EnumType } from '@cliffy/command';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+import { streamText, CoreMessage, stepCountIs } from 'ai';
+import { colors } from '@cliffy/ansi/colors';
+import { computeDiff } from './lib/computeDiff.ts';
+import { loadInitialTable } from './lib/loadInitialTable.ts';
+import { tableToTSV, tableToMarkdown, parseTSV } from './lib/spreadsheet.ts';
+import { readLine } from './lib/readLine.ts';
+import { confirm } from './lib/confirm.ts';
+import {
+	toolsVercelAI,
+	toolEditCells,
+	toolReplaceAll,
+	toolReplaceArea,
+	toolStrReplace,
+} from './lib/tools.ts';
+
+const PROVIDER_DEFAULTS = {
+	anthropic: {
+		model: 'claude-sonnet-4-5-20250929',
+		providerOptions: {
+			anthropic: {
+				thinking: { type: 'enabled', budgetTokens: 4096 },
+			},
+		},
+	},
+	openrouter: {
+		model: 'z-ai/glm-4.6:exacto',
+		providerOptions: {
+			openrouter: {
+				reasoning: {
+					max_tokens: 4096,
+				},
+			},
+		},
+	},
+} as const;
 
 let DEBUG = false;
 
 function debug(message: string, data?: unknown) {
-  if (DEBUG) {
-    console.log(`[DEBUG] ${message}`);
-    if (data !== undefined) {
-      console.log(JSON.stringify(data, null, 2));
-    }
-  }
-}
-
-type Cell = string;
-type Row = Cell[];
-type Table = Row[];
-
-// Parse TSV file into 2D array
-function parseTSV(content: string): Table {
-  const lines = content.split("\n");
-  const table: Table = [];
-
-  for (const line of lines) {
-    // Split by tabs, treat cells with tabs as empty
-    const cells = line.split("\t").map(cell =>
-      cell.includes("\t") ? "" : cell
-    );
-    table.push(cells);
-  }
-
-  // Remove only the final empty row if file ends with newline
-  if (table.length > 0 && table[table.length - 1].length === 1 && table[table.length - 1][0] === "") {
-    table.pop();
-  }
-
-  return table;
-}
-
-// Convert 2D array to TSV string
-function tableToTSV(table: Table): string {
-  return table.map(row => row.join("\t")).join("\n") + "\n";
-}
-
-// Generate column labels A, B, C, ..., Z
-function getColumnLabel(index: number): string {
-  if (index >= MAX_COLUMNS) {
-    throw new Error(`Column index ${index} exceeds maximum of ${MAX_COLUMNS}`);
-  }
-  return String.fromCharCode(65 + index); // A=65
-}
-
-// Convert table to markdown with row numbers and column labels
-function tableToMarkdown(table: Table): string {
-  if (table.length === 0) return "";
-  if (table.length > MAX_ROWS) {
-    throw new Error(`Table has ${table.length} rows, exceeds maximum of ${MAX_ROWS}`);
-  }
-
-  const numCols = Math.max(...table.map(row => row.length));
-  if (numCols > MAX_COLUMNS) {
-    throw new Error(`Table has ${numCols} columns, exceeds maximum of ${MAX_COLUMNS}`);
-  }
-
-  // Header row with column labels
-  const headers = ["", ...Array.from({ length: numCols }, (_, i) => getColumnLabel(i))];
-  const headerRow = "| " + headers.join(" | ") + " |";
-
-  // Separator row
-  const separator = "| " + headers.map(() => "---").join(" | ") + " |";
-
-  // Data rows with row numbers
-  const dataRows = table.map((row, rowIndex) => {
-    const paddedRow = [...row];
-    // Pad row to have same number of columns
-    while (paddedRow.length < numCols) {
-      paddedRow.push("");
-    }
-    const cells = [String(rowIndex + 1), ...paddedRow.map(cell => cell || " ")];
-    return "| " + cells.join(" | ") + " |";
-  });
-
-  return [headerRow, separator, ...dataRows].join("\n");
-}
-
-// Parse markdown table back to 2D array
-function markdownToTable(markdown: string): Table {
-  const lines = markdown.trim().split("\n");
-  const table: Table = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-
-    // Skip separator lines (contain only -, |, and spaces)
-    if (/^[\s|\-]+$/.test(line)) continue;
-
-    // Skip header row (first non-separator row)
-    if (i === 0) continue;
-
-    // Parse data rows
-    const cells = line.split("|")
-      .map(cell => cell.trim())
-      .filter((_, index, arr) => index > 0 && index < arr.length - 1); // Remove first/last empty
-
-    // Skip row number (first cell)
-    const dataCells = cells.slice(1).map(cell => cell === " " ? "" : cell);
-    table.push(dataCells);
-  }
-
-  return table;
-}
-
-// Git-style unified diff between two TSV strings
-function computeDiff(oldTSV: string, newTSV: string): string {
-  if (oldTSV === newTSV) {
-    return "No changes.";
-  }
-
-  const oldLines = oldTSV.split('\n');
-  const newLines = newTSV.split('\n');
-
-  // Simple line-by-line LCS-based diff
-  interface LineOp {
-    type: 'equal' | 'delete' | 'insert';
-    oldLine?: number;
-    newLine?: number;
-    content: string;
-  }
-
-  // Compute LCS (Longest Common Subsequence)
-  const lcs: number[][] = [];
-  for (let i = 0; i <= oldLines.length; i++) {
-    lcs[i] = [];
-    for (let j = 0; j <= newLines.length; j++) {
-      if (i === 0 || j === 0) {
-        lcs[i][j] = 0;
-      } else if (oldLines[i - 1] === newLines[j - 1]) {
-        lcs[i][j] = lcs[i - 1][j - 1] + 1;
-      } else {
-        lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
-      }
-    }
-  }
-
-  // Backtrack to build the diff
-  const ops: LineOp[] = [];
-  let i = oldLines.length;
-  let j = newLines.length;
-
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
-      ops.unshift({ type: 'equal', oldLine: i - 1, newLine: j - 1, content: oldLines[i - 1] });
-      i--;
-      j--;
-    } else if (j > 0 && (i === 0 || lcs[i][j - 1] >= lcs[i - 1][j])) {
-      ops.unshift({ type: 'insert', newLine: j - 1, content: newLines[j - 1] });
-      j--;
-    } else if (i > 0) {
-      ops.unshift({ type: 'delete', oldLine: i - 1, content: oldLines[i - 1] });
-      i--;
-    }
-  }
-
-  // Group into hunks with context
-  const CONTEXT_LINES = 3;
-  const hunks: { start: number; end: number }[] = [];
-
-  for (let idx = 0; idx < ops.length; idx++) {
-    if (ops[idx].type !== 'equal') {
-      const hunkStart = Math.max(0, idx - CONTEXT_LINES);
-      let hunkEnd = idx;
-
-      // Extend to include nearby changes
-      while (hunkEnd < ops.length) {
-        let foundChange = false;
-        const searchEnd = Math.min(hunkEnd + CONTEXT_LINES * 2 + 1, ops.length);
-        for (let k = hunkEnd; k < searchEnd; k++) {
-          if (ops[k].type !== 'equal') {
-            foundChange = true;
-            hunkEnd = k;
-          }
-        }
-        if (!foundChange) break;
-        hunkEnd++;
-      }
-
-      hunkEnd = Math.min(ops.length - 1, hunkEnd + CONTEXT_LINES);
-
-      // Merge overlapping hunks
-      if (hunks.length > 0 && hunkStart <= hunks[hunks.length - 1].end + 1) {
-        hunks[hunks.length - 1].end = hunkEnd;
-      } else {
-        hunks.push({ start: hunkStart, end: hunkEnd });
-      }
-
-      idx = hunkEnd;
-    }
-  }
-
-  if (hunks.length === 0) {
-    return "No changes.";
-  }
-
-  // Format output
-  const output: string[] = [];
-
-  for (const hunk of hunks) {
-    const hunkOps = ops.slice(hunk.start, hunk.end + 1);
-
-    // Calculate hunk header
-    let oldStart = -1;
-    let newStart = -1;
-    let oldCount = 0;
-    let newCount = 0;
-
-    for (const op of hunkOps) {
-      if (op.oldLine !== undefined) {
-        if (oldStart === -1) oldStart = op.oldLine;
-        oldCount++;
-      }
-      if (op.newLine !== undefined) {
-        if (newStart === -1) newStart = op.newLine;
-        newCount++;
-      }
-    }
-
-    output.push(colors.cyan(`@@ -${oldStart + 1},${oldCount} +${newStart + 1},${newCount} @@`));
-
-    for (const op of hunkOps) {
-      // Make tabs visible by replacing them with a visual marker
-      const visibleContent = op.content.replace(/\t/g, colors.dim('→') + '\t');
-
-      if (op.type === 'delete') {
-        output.push(colors.red(`-${visibleContent}`));
-      } else if (op.type === 'insert') {
-        output.push(colors.green(`+${visibleContent}`));
-      } else {
-        output.push(` ${visibleContent}`);
-      }
-    }
-  }
-
-  return output.join('\n');
+	if (DEBUG) {
+		console.log(`[DEBUG] ${message}`);
+		if (data !== undefined) {
+			console.log(JSON.stringify(data, null, 2));
+		}
+	}
 }
 
 // Main function
 async function main() {
-  // Parse arguments
-  let filePath: string | null = null;
-  let model = DEFAULT_MODEL;
+	const providerType = new EnumType(['anthropic', 'openrouter']);
 
-  for (let i = 0; i < Deno.args.length; i++) {
-    const arg = Deno.args[i];
-    if (arg === "--model" || arg === "-m") {
-      if (i + 1 >= Deno.args.length) {
-        console.error("Error: --model flag requires a value");
-        Deno.exit(1);
-      }
-      model = Deno.args[++i];
-    } else if (arg === "--debug" || arg === "-d") {
-      DEBUG = true;
-    } else if (arg.startsWith("--")) {
-      console.error(`Unknown flag: ${arg}`);
-      console.error("Usage: tsvd [--model MODEL] [--debug] <file.tsv>");
-      Deno.exit(1);
-    } else {
-      filePath = arg;
-    }
-  }
+	const { options, args } = await new Command()
+		.name('tsvd')
+		.version('0.1.0')
+		.description('TSV/Markdown Spreadsheet Editor with AI assistance')
+		.type('provider', providerType)
+		.option('-d, --debug', 'Enable debug output.')
+		.option('-m, --model <model:string>', 'Model to use (defaults based on provider).')
+		.option('-p, --provider <provider:provider>', 'Provider: anthropic or openrouter (auto-detected from API keys).')
+		.option('--prompt <prompt:string>', 'Initial prompt to send to the model.')
+		.arguments('[file:string]')
+		.parse(Deno.args);
 
-  if (!filePath) {
-    console.error("Usage: tsvd [--model MODEL] [--debug] <file.tsv>");
-    Deno.exit(1);
-  }
+	// Set debug flag
+	DEBUG = options.debug || false;
 
-  // Check API key
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) {
-    console.error("Error: ANTHROPIC_API_KEY environment variable not set");
-    console.error("Set it with: export ANTHROPIC_API_KEY=your-api-key");
-    Deno.exit(1);
-  }
+	// Check if reading from stdin (special argument "-")
+	const readFromStdin = args[0] === '-';
+	const filePath = readFromStdin ? null : (args[0] || null);
 
-  // Read and parse TSV file
-  let content: string;
-  try {
-    content = await Deno.readTextFile(filePath);
-  } catch (err) {
-    console.error(`Error reading file: ${err.message}`);
-    Deno.exit(1);
-  }
+	let model = options.model || null;
+	let provider = options.provider || null;
 
-  let currentTable: Table;
-  try {
-    currentTable = parseTSV(content);
-  } catch (err) {
-    console.error(`Error parsing TSV: ${err.message}`);
-    Deno.exit(1);
-  }
+	// Check available API keys
+	const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY');
+	const openrouterKey = Deno.env.get('OPENROUTER_API_KEY');
 
-  // Validate dimensions
-  try {
-    tableToMarkdown(currentTable); // This will throw if dimensions exceeded
-  } catch (err) {
-    console.error(`Error: ${err.message}`);
-    Deno.exit(1);
-  }
+	// Determine provider: explicit flag > api_key_defined
+	if (!provider) {
+		// No explicit flag - use whichever API key is defined
+		if (anthropicKey) {
+			provider = 'anthropic';
+		} else if (openrouterKey) {
+			provider = 'openrouter';
+		} else {
+			console.error('Error: No --provider flag given and no API keys found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY.');
+			Deno.exit(1);
+		}
+	}
 
-  const numCols = Math.max(...currentTable.map(row => row.length), 0);
+	// Validate the selected provider has its API key
+	if (provider === 'anthropic' && !anthropicKey) {
+		console.error('Error: --provider anthropic specified but ANTHROPIC_API_KEY environment variable not set');
+		Deno.exit(1);
+	}
 
-  console.log(`\nLoaded ${filePath} (${currentTable.length} rows, ${numCols} columns)\n`);
+	if (provider === 'openrouter' && !openrouterKey) {
+		console.error('Error: --provider openrouter specified but OPENROUTER_API_KEY environment variable not set');
+		Deno.exit(1);
+	}
 
-  if (DEBUG) {
-    console.log(`[DEBUG] Debug mode enabled`);
-    console.log(`[DEBUG] Model: ${model}`);
-    console.log(`[DEBUG] Initial table dimensions: ${currentTable.length}x${numCols}\n`);
-  }
+	// Set default model for provider if not explicitly specified
+	if (!model) {
+		model = PROVIDER_DEFAULTS[provider].model;
+	}
 
-  // Extract filename without extension
-  const fileNameWithoutExt = filePath!.replace(/\.[^/.]+$/, '').split('/').pop() || 'spreadsheet';
+	// Load the initial table from stdin, file, or editor
+	let {
+		table: currentTable,
+		filePath: workingFilePath,
+		originalFilePath,
+	} = await loadInitialTable(filePath, readFromStdin);
 
-  // System prompt
-  const systemPrompt = `*booting tsvd* ...
+	// Set up signal handler with closure over local variables
+	let handlingSignal = false;
+	Deno.addSignalListener('SIGINT', () => {
+		if (handlingSignal) return; // Prevent re-entry
+		handlingSignal = true;
 
-You've been asked to take a look at "${fileNameWithoutExt}". The file is loading before you now. Looks like a spreadsheet. Seems important.
+		// Signal handler for Ctrl+C
+		(async () => {
+			console.log(); // New line after ^C
+
+			if (!workingFilePath || !currentTable) {
+				// No active session, just exit
+				Deno.exit(0);
+			}
+
+			await handleExit(
+				currentTable,
+				originalFilePath,
+			);
+			Deno.exit(0);
+		})().catch((err) => {
+			console.error(`Error in signal handler: ${err.message}`);
+			Deno.exit(1);
+		});
+	});
+
+	const numCols = Math.max(...currentTable.map((row) => row.length), 0);
+
+	if (originalFilePath) {
+		console.log(colors.dim(colors.italic(
+			`→ Loaded ${originalFilePath} (${currentTable.length} rows, ${numCols} columns) — working file: ${workingFilePath}`,
+		)));
+	} else if (readFromStdin) {
+		console.log(colors.dim(colors.italic(
+			`→ Loaded spreadsheet from stdin (${currentTable.length} rows, ${numCols} columns) — working file: ${workingFilePath}`,
+		)));
+	} else {
+		console.log(colors.dim(colors.italic(
+			`→ Loaded spreadsheet (${currentTable.length} rows, ${numCols} columns) — working file: ${workingFilePath}`,
+		)));
+	}
+
+	if (DEBUG) {
+		console.log(`[DEBUG] Debug mode enabled`);
+		console.log(`[DEBUG] Provider: ${provider}`);
+		console.log(`[DEBUG] Model: ${model}`);
+		console.log(
+			`[DEBUG] Initial table dimensions: ${currentTable.length}x${numCols}`,
+		);
+	}
+
+	// Extract filename without extension
+	const fileNameWithoutExt = originalFilePath
+		? originalFilePath
+				.replace(/\.[^/.]+$/, '')
+				.split('/')
+				.pop() || 'spreadsheet'
+		: 'spreadsheet';
+
+	// System prompt
+	const introSentence = originalFilePath
+		? `You've been asked to take a look at "${fileNameWithoutExt}". The file is loading before you now. Looks like a spreadsheet. Seems important.`
+		: `A file is loading before you now. Looks like a spreadsheet. Seems important.`;
+
+	const systemPrompt = `*booting tsvd* ...
+
+${introSentence}
+
+While waiting, you remember your training. They always said: "Never change comma decimals unless you have a good reason." Good advice. Better think twice when encountering them. Assuming the wrong locale will mess up people's data badly.
+
+For example, Google Sheets does =SUM(A1;A2;A3), not =SUM(A1,A2,A3) in European locales. Have to be aware of that.
 
 The data appears as a markdown table - row numbers down the left, column labels across the top (A, B, C...). Someone needs your help making changes to it.
 
-You notice something interesting: this isn't just a plain spreadsheet. It understands formulas - the Excel kind. SUM, AVERAGE, IF statements, VLOOKUP, cell references like A1 or B2, ranges like A1:A10. Arrays too. The works.
+You've got tools at your disposal. edit_cells for surgical changes, str_replace for replace efficiently, replace_all for big overhauls, and finally replace_area to shift or rewrite rectangular blocks of data.
 
-One quirk though - when you're writing formulas here, parameters get separated by semicolons, not commas. So it's =SUM(A1;A2;A3), not =SUM(A1,A2,A3). Google Sheets does this in European locales, so it's not unheard of.
+The spreadsheet has no bounds, all your tools can write outside the frame to expand the sheet if needed.
 
-You've got two tools at your disposal: str_replace for surgical edits when you know exactly what to change, and replace_all for when you need to rebuild the whole thing.
+Thats it. Time to see what they need.`;
 
-Time to see what they need.`;
+	// Initialize provider based on selection
+	let languageModel;
+	if (provider === 'anthropic') {
+		const anthropic = createAnthropic({ apiKey: anthropicKey! });
+		languageModel = anthropic(model);
+	} else {
+		const openrouter = createOpenRouter({ apiKey: openrouterKey! });
+		languageModel = openrouter(model);
+	}
 
-  // Initialize Anthropic client
-  const anthropic = new Anthropic({ apiKey });
+	// Conversation history
+	const messages: CoreMessage[] = [];
 
-  // Tools definition
-  const tools: Anthropic.Tool[] = [
-    {
-      name: "str_replace",
-      description: "Replace a substring in the current spreadsheet. Use for targeted edits. Returns error if substring appears multiple times.",
-      input_schema: {
-        type: "object",
-        properties: {
-          old_str: {
-            type: "string",
-            description: "Exact string to find (must appear exactly once)",
-          },
-          new_str: {
-            type: "string",
-            description: "Replacement string",
-          },
-        },
-        required: ["old_str", "new_str"],
-      },
-    },
-    {
-      name: "replace_all",
-      description: "Replace entire spreadsheet with new markdown table. Use for sorting, major restructuring, or when many changes needed.",
-      input_schema: {
-        type: "object",
-        properties: {
-          new_table: {
-            type: "string",
-            description: "Complete new markdown table with row numbers and column labels",
-          },
-        },
-        required: ["new_table"],
-      },
-    },
-  ];
+	// Initial prompt from command line
+	let initialPrompt = options.prompt || null;
 
-  // Conversation history
-  const messages: Anthropic.MessageParam[] = [];
+	// Interactive loop
+	while (true) {
+		// Prompt for input (use initial prompt on first iteration, then ask user)
+		const prompt = initialPrompt !== null
+			? initialPrompt
+			: await readLine(colors.cyan('prompt › '));
+		
+		// Clear initial prompt after first use
+		if (initialPrompt !== null) {
+			// Display it so user sees what was sent
+			console.log(colors.cyan('prompt › ') + initialPrompt);
+			initialPrompt = null;
+		}
 
-  // Signal handler for Ctrl+C
-  let shouldExit = false;
-  const sigintHandler = () => {
-    if (!shouldExit) {
-      shouldExit = true;
-      console.log("\n");
-      // Force exit from stdin read
-      Deno.stdin.close();
-    }
-  };
-  Deno.addSignalListener("SIGINT", sigintHandler);
+		// User interrupted (Ctrl+C) or empty prompt
+		if (prompt === null || prompt.trim() === '') {
+			await handleExit(
+				currentTable,
+				originalFilePath,
+			);
 
-  // Interactive loop
-  while (!shouldExit) {
-    // Prompt for input
-    let prompt: string;
-    try {
-      prompt = await Input.prompt({
-        message: "",
-        prefix: colors.blue("user"),
-        indent: "",
-      });
-    } catch {
-      // stdin closed (Ctrl+C)
-      break;
-    }
+			if (DEBUG) {
+				console.error(`Breaking: prompt="${prompt}"`);
+			}
+			break;
+		}
 
-    if (!prompt || prompt.trim() === "" || shouldExit) {
-      break;
-    }
+		// Add user message
+		messages.push({
+			role: 'user',
+			content: `Current spreadsheet:\n\n${tableToMarkdown(currentTable)}\n\n${prompt}`,
+		});
 
-    // Add user message
-    messages.push({
-      role: "user",
-      content: `Current spreadsheet:\n\n${tableToMarkdown(currentTable)}\n\n${prompt}`,
-    });
+		// Call Claude with streaming via Vercel AI SDK
+		try {
+			debug(`Calling ${provider} API`, {
+				model,
+				messageCount: messages.length,
+			});
 
-    // Save state file in debug mode
-    if (DEBUG) {
-      const stateFilePath = `${filePath}.state`;
-      const stateContent = tableToMarkdown(currentTable);
-      try {
-        await Deno.writeTextFile(stateFilePath, stateContent);
-        debug("Saved state file", { path: stateFilePath });
-      } catch (err) {
-        debug("Failed to save state file", { error: err.message });
-      }
-    }
+			let outputMode: 'none' | 'thinking' | 'text' = 'none';
+			let workingTable = structuredClone(currentTable);
+			let hasSuccessfulChanges = false;
+			const errors: string[] = [];
+			let lastOutputChars = ''; // Track last few chars to ensure single newline at end
 
-    // Call Claude with streaming
-    let responseContent: Anthropic.ContentBlock[] = [];
-    try {
-      debug("Calling Claude API (streaming)", { model, messageCount: messages.length });
+			// Create tools with execute functions that modify workingTable
+			const toolsWithExecute = {
+				str_replace: {
+					...toolsVercelAI.str_replace,
+					execute: (args: { old_str: string; new_str: string }) => {
+						const result = toolStrReplace(workingTable, args);
+						if (result.success && result.proposedTable) {
+							workingTable = result.proposedTable;
+							hasSuccessfulChanges = true;
+							return `Replaced "${args.old_str}" with "${args.new_str}"`;
+						} else {
+							errors.push(`str_replace(${args.old_str}, ${args.new_str}): ${result.error}`);
+							return `Error: ${result.error}`;
+						}
+					},
+				},
+				replace_all: {
+					...toolsVercelAI.replace_all,
+					execute: (args: { new_table: string }) => {
+						const result = toolReplaceAll(workingTable, args);
+						if (result.success && result.proposedTable) {
+							workingTable = result.proposedTable;
+							hasSuccessfulChanges = true;
+							return 'Replaced entire table';
+						} else {
+							const preview = args.new_table.length > 50 ? args.new_table.substring(0, 47) + '...' : args.new_table;
+							errors.push(`replace_all(${preview}): ${result.error}`);
+							return `Error: ${result.error}`;
+						}
+					},
+				},
+				edit_cells: {
+					...toolsVercelAI.edit_cells,
+					execute: (args: { edits: { cell: string; value: string }[] }) => {
+						const result = toolEditCells(workingTable, args);
+						if (result.success && result.proposedTable) {
+							workingTable = result.proposedTable;
+							hasSuccessfulChanges = true;
+							return `Edited ${args.edits.length} cell(s)`;
+						} else {
+							const editsPreview = args.edits.slice(0, 2).map(e => `${e.cell}=${e.value}`).join(', ') + (args.edits.length > 2 ? '...' : '');
+							errors.push(`edit_cells([${editsPreview}]): ${result.error}`);
+							return `Error: ${result.error}`;
+						}
+					},
+				},
+				replace_area: {
+					...toolsVercelAI.replace_area,
+					execute: (args: { from_cell: string; to_cell: string; values: string[][] }) => {
+						const result = toolReplaceArea(workingTable, args);
+						if (result.success && result.proposedTable) {
+							workingTable = result.proposedTable;
+							hasSuccessfulChanges = true;
+							return `Replaced area ${args.from_cell}:${args.to_cell}`;
+						} else {
+							errors.push(`replace_area(${args.from_cell}, ${args.to_cell}, [${args.values.length} rows]): ${result.error}`);
+							return `Error: ${result.error}`;
+						}
+					},
+				},
+			};
 
-      const stream = await anthropic.messages.stream({
-        model,
-        max_tokens: 8192,
-        system: systemPrompt,
-        tools,
-        messages,
-        thinking: {
-          type: "enabled",
-          budget_tokens: 4096,
-        },
-      });
+			// Build stream options
+			const streamOptions: Record<string, any> = {
+				model: languageModel,
+				system: providerType === 'anthropic' ? [
+					{
+						role: 'system' as const,
+						content: systemPrompt,
+						providerOptions: {
+							anthropic: {
+								cacheControl: { type: 'ephemeral' as const },
+							},
+						},
+					},
+				] : systemPrompt,
+				messages,
+				tools: providerType === 'anthropic'
+					? Object.fromEntries(
+						Object.entries(toolsWithExecute).map(([name, tool]) => [
+							name,
+							{
+								...tool,
+								providerOptions: {
+									anthropic: {
+										cacheControl: { type: 'ephemeral' as const },
+									},
+								},
+							},
+						])
+					)
+					: toolsWithExecute,
+				stopWhen: stepCountIs(5),
+				onChunk({ chunk }) {
+					if (chunk.type === 'reasoning-delta') {
+						// Transition to thinking mode if not already in it
+						if (outputMode !== 'thinking') {
+							Deno.stdout.writeSync(
+								new TextEncoder().encode(
+									colors.dim(colors.white('[thinking] ')),
+								),
+							);
+							outputMode = 'thinking';
+						}
+						Deno.stdout.writeSync(
+							new TextEncoder().encode(colors.dim(colors.white(chunk.text))),
+						);
+					} else if (chunk.type === 'text-delta') {
+						// Transition to text mode if not already in it
+						if (outputMode !== 'text') {
+							Deno.stdout.writeSync(
+								new TextEncoder().encode(colors.cyan('\ntsvd › ')),
+							);
+							outputMode = 'text';
+						}
+						Deno.stdout.writeSync(new TextEncoder().encode(chunk.text));
+						// Track last few characters for newline normalization
+						lastOutputChars = (lastOutputChars + chunk.text).slice(-5);
+					} else if (chunk.type === 'tool-call') {
+						// Display tool call inline as it happens
+						const args = chunk.input as Record<string, unknown>;
+						const paramKeys = Object.keys(args);
 
-      // Stream text blocks to stdout with prefix
-      let isFirstChunk = true;
-      let isFirstThinkingChunk = true;
-      let response: Anthropic.Message | null = null;
+						// Show abbreviated parameters
+						let paramStr = '';
+						if (paramKeys.length > 0) {
+							const paramParts: string[] = [];
+							for (const key of paramKeys.slice(0, 3)) {
+								const value = args[key];
+								let valueStr: string;
 
-      // Process streaming events
-      for await (const event of stream) {
-        if (event.type === 'content_block_start') {
-          if (event.content_block.type === 'tool_use') {
-            // Output tool call indicator
-            const toolName = event.content_block.name;
-            Deno.stdout.writeSync(new TextEncoder().encode(colors.yellow(` [${toolName}] `)));
-          }
-        } else if (event.type === 'content_block_delta') {
-          if (event.delta.type === 'thinking_delta') {
-            if (isFirstThinkingChunk) {
-              Deno.stdout.writeSync(new TextEncoder().encode(colors.dim(colors.white('\n[thinking]\n'))));
-              isFirstThinkingChunk = false;
-            }
-            Deno.stdout.writeSync(new TextEncoder().encode(colors.dim(colors.white(event.delta.thinking))));
-          } else if (event.delta.type === 'text_delta') {
-            if (isFirstChunk) {
-              // Output newline after thinking ends
-              if (!isFirstThinkingChunk) {
-                Deno.stdout.writeSync(new TextEncoder().encode('\n'));
-              }
-              Deno.stdout.writeSync(new TextEncoder().encode(colors.cyan('tsvd › ')));
-              isFirstChunk = false;
-            }
-            Deno.stdout.writeSync(new TextEncoder().encode(event.delta.text));
-          }
-        } else if (event.type === 'message_stop') {
-          response = await stream.finalMessage();
-        }
-      }
+								if (typeof value === 'object' && value !== null) {
+									valueStr = JSON.stringify(value);
+								} else {
+									valueStr = String(value);
+								}
 
-      console.log(); // Add newline after streaming output
+								if (valueStr.length > 120) {
+									valueStr = valueStr.substring(0, 117) + '...';
+								}
+								valueStr = valueStr.replace(/\s+/g, ' ');
+								paramParts.push(valueStr);
+							}
+							if (paramKeys.length > 3) {
+								paramParts.push('...');
+							}
+							paramStr = `(${paramParts.join(', ')})`;
+						}
 
-      if (!response) {
-        response = await stream.finalMessage();
-      }
+						Deno.stdout.writeSync(
+							new TextEncoder().encode(
+								colors.yellow(`\n[${chunk.toolName}${paramStr}]`),
+							),
+						);
+					}
+				},
+				onError({ error }) {
+					console.error(colors.red('\n✖ API Error:'));
+					if (error instanceof Error) {
+						console.error(colors.red(`  ${error.message}`));
+						if (DEBUG && error.stack) {
+							console.error(colors.dim(error.stack));
+						}
+					} else if (typeof error === 'object' && error !== null) {
+						console.error(colors.red(`  ${JSON.stringify(error, null, 2)}`));
+					} else {
+						console.error(colors.red(`  ${String(error)}`));
+					}
+					console.error('');
+				},
+			};
 
-      responseContent = response.content;
+			// Add provider-specific options (including extended thinking)
+			streamOptions.providerOptions = PROVIDER_DEFAULTS[provider].providerOptions;
 
-      debug("Claude API response received", {
-        stopReason: response.stop_reason,
-        contentBlocks: responseContent.length
-      });
-    } catch (err) {
-      console.error(`\nAPI Error: ${err.message}\n`);
-      messages.pop(); // Remove the failed message
-      continue;
-    }
+			const result = streamText(streamOptions);
 
-    // Process tool calls and apply changes sequentially to a working copy
-    type ToolResult = {
-      toolUseId: string;
-      success: boolean;
-      error?: string;
-    };
+			// Wait for the stream to complete
+			const finishReason = await result.finishReason;
+			const steps = await result.steps;
+			const response = await result.response;
+			const providerMetadata = await result.experimental_providerMetadata;
+			const usage = await result.usage;
+			const text = await result.text;
 
-    const toolResults: ToolResult[] = [];
-    let workingTable = structuredClone(currentTable);
-    let hasSuccessfulChanges = false;
-    const errors: string[] = [];
+			debug(`${provider} API response completed`, {
+				finishReason,
+				stepsCount: steps ? steps.length : 0,
+				usage: usage ? {
+					promptTokens: usage.promptTokens,
+					completionTokens: usage.completionTokens,
+					totalTokens: usage.totalTokens,
+				} : undefined,
+				textLength: text ? text.length : 0,
+			});
 
-    for (const block of responseContent) {
-      if (block.type === "tool_use") {
-        const toolName = block.name;
-        const toolInput = block.input as Record<string, string>;
+			// Log cache usage metrics for Anthropic
+			if (providerType === 'anthropic' && providerMetadata?.anthropic) {
+				const cacheMetrics = providerMetadata.anthropic;
+				if (cacheMetrics.cacheCreationInputTokens || cacheMetrics.cacheReadInputTokens) {
+					debug('Prompt cache metrics', {
+						cacheCreationTokens: cacheMetrics.cacheCreationInputTokens || 0,
+						cacheReadTokens: cacheMetrics.cacheReadInputTokens || 0,
+					});
+				}
+			}
 
-        debug(`Processing tool: ${toolName}`, toolInput);
+			// Ensure exactly one newline at end of model output
+			if (outputMode === 'text') {
+				// Count trailing newlines
+				const trailingNewlines = lastOutputChars.match(/\n*$/)?.[0].length || 0;
+				if (trailingNewlines === 0) {
+					// No trailing newline, add one
+					Deno.stdout.writeSync(new TextEncoder().encode('\n'));
+				} else if (trailingNewlines > 1) {
+					// Multiple trailing newlines already present, do nothing
+					// (we already output them during streaming)
+				}
+				// If exactly 1 newline, perfect - do nothing
+			}
 
-        let result: { success: boolean; error?: string; proposedTable?: Table } = { success: false };
+			// Tool calls are now displayed inline during streaming
 
-        if (toolName === "str_replace") {
-          const oldStr = toolInput.old_str;
-          const newStr = toolInput.new_str;
-          const currentMarkdown = tableToMarkdown(workingTable);
+			// Show any errors that occurred
+			if (errors.length > 0) {
+				console.log(colors.red('\nErrors occurred:'));
+				for (const error of errors) {
+					console.log(colors.red(`  - ${error}`));
+				}
+				console.log();
+			}
 
-          // Count occurrences
-          const occurrences = (currentMarkdown.match(new RegExp(escapeRegex(oldStr), "g")) || []).length;
+			// After model finishes, show final cumulative diff and prompt for confirmation
+			let changesApplied = false;
 
-          if (occurrences === 0) {
-            result = { success: false, error: "String not found in spreadsheet" };
-          } else if (occurrences > 1) {
-            result = { success: false, error: `String appears ${occurrences} times. Please be more specific or use replace_all.` };
-          } else {
-            const newMarkdown = currentMarkdown.replace(oldStr, newStr);
-            try {
-              result = { success: true, proposedTable: markdownToTable(newMarkdown) };
-            } catch (err) {
-              result = { success: false, error: `Failed to parse result: ${err.message}` };
-            }
-          }
-        } else if (toolName === "replace_all") {
-          const newMarkdown = toolInput.new_table;
-          try {
-            const newTable = markdownToTable(newMarkdown);
-            // Validate dimensions
-            if (newTable.length > MAX_ROWS) {
-              result = { success: false, error: `Result has ${newTable.length} rows, exceeds maximum of ${MAX_ROWS}` };
-            } else {
-              const newNumCols = Math.max(...newTable.map(row => row.length), 0);
-              if (newNumCols > MAX_COLUMNS) {
-                result = { success: false, error: `Result has ${newNumCols} columns, exceeds maximum of ${MAX_COLUMNS}` };
-              } else {
-                result = { success: true, proposedTable: newTable };
-              }
-            }
-          } catch (err) {
-            result = { success: false, error: `Failed to parse markdown table: ${err.message}` };
-          }
-        }
+			if (hasSuccessfulChanges) {
+				// Show the final cumulative diff
+				const oldTSV = tableToTSV(currentTable);
+				const newTSV = tableToTSV(workingTable);
+				const diff = computeDiff(oldTSV, newTSV);
 
-        // Apply successful changes to working copy
-        if (result.success && result.proposedTable) {
-          workingTable = result.proposedTable;
-          hasSuccessfulChanges = true;
+				console.log(
+					colors.bold(
+						colors.cyan(
+							'\n╭─ Proposed changes ─────────────────────────────────────────',
+						),
+					),
+				);
+				// Trim trailing newline from diff to avoid extra blank line
+				console.log(diff.trimEnd());
+				console.log(
+					colors.bold(
+						colors.cyan(
+							'├────────────────────────────────────────────────────────────',
+						),
+					),
+				);
+				// Prompt user to apply changes
+				const confirmResult = await confirm(
+					'Accept changes?',
+					true,
+				);
 
-          toolResults.push({
-            toolUseId: block.id,
-            success: true,
-          });
-        } else {
-          errors.push(result.error!);
-          toolResults.push({
-            toolUseId: block.id,
-            success: false,
-            error: result.error,
-          });
-        }
-      }
-    }
+				if (confirmResult === null) {
+					// User pressed Ctrl+C
+					console.log(colors.dim(colors.italic('→ Changes not applied.')));
+				} else if (confirmResult) {
+					currentTable = workingTable;
 
-    // Show any errors that occurred
-    if (errors.length > 0) {
-      console.log(colors.red("\nErrors occurred:"));
-      for (const error of errors) {
-        console.log(colors.red(`  - ${error}`));
-      }
-      console.log();
-    }
+					// Save to working temp file only (not to original file yet)
+					try {
+						await Deno.writeTextFile(workingFilePath, newTSV);
+						console.log(
+							colors.dim(
+								colors.italic(`→ Working file updated: ${workingFilePath}`),
+							),
+						);
+						changesApplied = true;
+					} catch (err: unknown) {
+						const message = err instanceof Error ? err.message : String(err);
+						console.error(`\nError writing file: ${message}\n`);
+					}
+				} else {
+					console.log(colors.dim(colors.italic('→ Changes not applied.')));
+				}
+			}
 
-    // After model finishes, show final cumulative diff and prompt for confirmation
-    let changesApplied = false;
+			// Add assistant response to conversation history
+			// Vercel AI SDK handles this automatically through the response.messages
+			const responseMessages = await response.messages;
+			if (responseMessages && responseMessages.length > 0) {
+				messages.push(...responseMessages);
+			}
 
-    if (hasSuccessfulChanges) {
-      // Show the final cumulative diff
-      const oldTSV = tableToTSV(currentTable);
-      const newTSV = tableToTSV(workingTable);
-      const diff = computeDiff(oldTSV, newTSV);
+			// Re-read table from disk after each turn if changes were applied
+			if (changesApplied) {
+				try {
+					const diskContent = await Deno.readTextFile(workingFilePath);
+					currentTable = parseTSV(diskContent);
+					if (DEBUG) {
+						console.log(colors.dim(`[Reloaded table from ${workingFilePath}]`));
+					}
+				} catch (err: unknown) {
+					const message = err instanceof Error ? err.message : String(err);
+					console.error(
+						colors.red(`Warning: Could not reload from disk: ${message}`),
+					);
+					// Continue with in-memory table
+				}
+			}
+		} catch (err: unknown) {
+			console.error(colors.red('\n✖ API Error:'));
+			if (err instanceof Error) {
+				console.error(colors.red(`  ${err.message}`));
+				if (DEBUG && err.stack) {
+					console.error(colors.dim(err.stack));
+				}
+			} else if (typeof err === 'object' && err !== null) {
+				console.error(colors.red(`  ${JSON.stringify(err, null, 2)}`));
+			} else {
+				console.error(colors.red(`  ${String(err)}`));
+			}
+			console.error('');
+			messages.pop(); // Remove the failed message
+			continue;
+		}
+	}
 
-      console.log(colors.bold(colors.cyan("\n╭─ Proposed changes ─────────────────────────────────────────")));
-      console.log(diff);
-      console.log();
+	// Clean up temp file
+	try {
+		await Deno.remove(workingFilePath);
+		if (DEBUG) {
+			console.log(`Cleaned up temp file: ${workingFilePath}`);
+		}
+	} catch {
+		// Ignore cleanup errors
+	}
 
-      // Prompt user to apply changes
-      let shouldApply: boolean;
-      try {
-        shouldApply = await Confirm.prompt({
-          message: "Apply changes to file?",
-          default: true,
-        });
-      } catch {
-        // User interrupted (Ctrl+C), don't apply
-        console.log("\nChanges not applied.\n");
-        shouldApply = false;
-      }
-
-      if (shouldApply) {
-        currentTable = workingTable;
-        try {
-          await Deno.writeTextFile(filePath, newTSV);
-          console.log("Changes applied.\n");
-          changesApplied = true;
-        } catch (err) {
-          console.error(`\nError writing file: ${err.message}\n`);
-        }
-      } else {
-        console.log("Changes not applied.\n");
-      }
-    }
-
-    // Add assistant response and tool results to conversation history
-    const conversationToolResults: Anthropic.MessageParam[] = toolResults.map(result => ({
-      role: "user" as const,
-      content: [{
-        type: "tool_result" as const,
-        tool_use_id: result.toolUseId,
-        content: result.success
-          ? (changesApplied ? "Success. Changes applied and saved." : "Success. Changes computed but not applied by user.")
-          : `Error: ${result.error}`,
-        is_error: result.success ? undefined : true,
-      }],
-    }));
-
-    messages.push({ role: "assistant", content: responseContent });
-    messages.push(...conversationToolResults);
-  }
-
-  // Cleanup signal handler
-  Deno.removeSignalListener("SIGINT", sigintHandler);
-
-  console.log("Goodbye!\n");
+	if (originalFilePath) {
+		console.log(
+			colors.dim(colors.italic(`→ All changes saved to ${originalFilePath}`)),
+		);
+	}
 }
 
-// Helper to escape regex special characters
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+async function handleExit(
+	currentTable: string[][],
+	originalFilePath: string | null,
+) {
+	// Check if there are unsaved changes
+	const currentTSV = tableToTSV(currentTable);
+	const diskContent = originalFilePath
+		? await Deno.readTextFile(originalFilePath).catch(() => '')
+		: '';
+
+	if (originalFilePath && currentTSV !== diskContent) {
+		console.log(
+			colors.yellow('\nYou have unsaved changes to the original file.'),
+		);
+		const saveConfirm = await confirm(
+			`Save to ${originalFilePath}?`,
+			true,
+		);
+
+		if (saveConfirm === null) {
+			// User pressed Ctrl+C again, force exit
+			console.log(colors.dim(colors.italic('→ Exiting without saving.')));
+			return;
+		}
+
+		if (saveConfirm) {
+			try {
+				await Deno.writeTextFile(originalFilePath, currentTSV);
+				console.log(
+					colors.dim(colors.italic(`→ Saved to ${originalFilePath}`)),
+				);
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.error(`\nError writing file: ${message}\n`);
+			}
+		} else {
+			console.log(colors.dim(colors.italic('→ Not saved. Working file will be removed.')));
+		}
+	} else if (!originalFilePath && currentTSV.trim() !== '') {
+		// No original file, ask if they want to save (if there's any content)
+		const saveConfirm = await confirm(
+			'Would you like to save your changes?',
+			true,
+		);
+
+		if (saveConfirm === null) {
+			console.log(colors.dim(colors.italic('→ Exiting without saving.')));
+			return;
+		}
+
+		if (saveConfirm) {
+			// Prompt for filename
+			const defaultFilename = `tsvd-${Date.now()}.tsv`;
+			const styledPrompt = colors.cyan(`Filename [${defaultFilename}]: `);
+			const filename = await readLine(styledPrompt);
+
+			if (filename === null) {
+				console.log(colors.dim(colors.italic('→ Exiting without saving.')));
+				return;
+			}
+
+			const targetFile = filename.trim() === '' ? defaultFilename : filename;
+
+			try {
+				await Deno.writeTextFile(targetFile, currentTSV);
+				console.log(colors.dim(colors.italic(`→ Saved to ${targetFile}`)));
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.error(`\nError writing file: ${message}\n`);
+			}
+		} else {
+			console.log(colors.dim(colors.italic('→ Not saved. Working file will be removed.')));
+		}
+	} else {
+		// No changes, just exit
+		console.log(colors.dim(colors.italic('→ No changes to save.')));
+	}
 }
 
-// Run main
+// Run main function
 if (import.meta.main) {
-  main().catch(err => {
-    console.error(`Fatal error: ${err.message}`);
-    Deno.exit(1);
-  });
+	main().catch((err) => {
+		console.error(`Fatal error: ${err.message}`);
+		Deno.exit(1);
+	});
 }

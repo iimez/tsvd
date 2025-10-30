@@ -1,28 +1,24 @@
 # tsvd
 
-An AI-powered TSV (Tab-Separated Values) editor that lets you modify spreadsheets using natural language.
+CLI to edit spreadsheets in TSV format, using LLMs.
 
 ## What is tsvd?
 
-tsvd is an interactive command-line tool to provide a Claude-Code like editing experience for spreadsheets in tsv format.
+A simple tool to interact with TSV data pasted from clipboard (copied from Excel or Google Sheets) or stored in files, using a natural language prompt / diff confirm loop.
 
-The harness improves reliability of AI when working on tabular data:
+The harness has some reliability improvements when working on tabular data:
 - Clearer column / row labelling to get cell references right
 - Makes sure AI assumes the spreadsheet has to be compatible with the featureset of Google Sheets
 - Nudges Claude not to break spreadsheets when working with data in non-US locales
-
-## Features
-
-- 💬 **Interactive Conversation**: Iterate on changes by prompting through a conversational interface
-- 🔍 **Diff Viewer**: See exactly what will change before applying
-- ✅ **Safe by Default**: Review and approve changes before they're saved, CTRL+C any time
 
 ## Installation
 
 ### Prerequisites
 
 - [Deno](https://deno.land/) runtime
-- An [Anthropic API key](https://console.anthropic.com/)
+- An API key from one of these providers:
+  - [Anthropic API key](https://console.anthropic.com/) in the `ANTHROPIC_API_KEY` environment variable
+  - [OpenRouter API key](https://openrouter.ai/settings/keys) in the `OPENROUTER_API_KEY` environment variable
 
 ### Setup
 
@@ -38,7 +34,7 @@ The harness improves reliability of AI when working on tabular data:
    ln -s /path/to/tsvd.ts /usr/local/bin/tsvd
    ```
 
-4. Set your Anthropic API key:
+4. Set your API key:
    ```bash
    export ANTHROPIC_API_KEY=your-api-key-here
    ```
@@ -48,7 +44,17 @@ The harness improves reliability of AI when working on tabular data:
 ### Basic Usage
 
 ```bash
+# Interactive mode
 tsvd data.tsv
+
+# Pass an initial prompt
+tsvd data.tsv --prompt "Add a Total column"
+
+# Read from stdin (paste TSV data)
+cat data.tsv | tsvd -
+
+# Will fall back to $EDITOR to ask for input
+tsvd
 ```
 
 This opens an interactive session where you can describe changes to make to your TSV file.
@@ -56,31 +62,38 @@ This opens an interactive session where you can describe changes to make to your
 ### Command-Line Options
 
 ```bash
-tsvd [OPTIONS] <file.tsv>
+tsvd [OPTIONS] [file]
 
 Options:
-  --model, -m <MODEL>    Specify Claude model (default: claude-sonnet-4-5-20250929)
-  --debug, -d            Enable debug mode with verbose logging
-  --help, -h             Show help message
+  -m, --model <model>        Model to use (defaults based on provider)
+  -p, --provider <provider>  Provider: anthropic or openrouter (auto-detected)
+  --prompt <prompt>          Initial prompt to send to the model
+  -d, --debug                Enable debug mode with verbose logging
+  -h, --help                 Show help message
+  -V, --version              Show version
+
+Arguments:
+  [file]                     TSV file to edit (optional, will prompt if not provided)
+  -                          Read from stdin
 ```
-
-## Requirements
-
-- **Deno**: The script runs on Deno (specified in shebang)
-- **Permissions**: Requires `--allow-read`, `--allow-write`, `--allow-env`, and `--allow-net`
-- **API Key**: Valid Anthropic API key in `ANTHROPIC_API_KEY` environment variable
 
 ### Examples
 
 ```bash
-# Edit a file with the default model
+# Edit a file with default provider (Anthropic if key is set)
 tsvd sales.tsv
 
-# Use a specific Claude model
-tsvd --model claude-opus-4-1-20250805 data.tsv
+# Use OpenRouter with a specific model
+OPENROUTER_API_KEY=... tsvd --provider openrouter --model openai/gpt-4o data.tsv
 
-# Enable debug mode
-tsvd --debug data.tsv
+# Pass an initial prompt to execute immediately
+tsvd data.tsv --prompt "Sort by price descending"
+
+# Read from stdin
+cat data.tsv | tsvd -
+
+# Combine options
+tsvd data.tsv --prompt "Add a Total column" --model claude-opus-4-1-20250805 --debug
 ```
 
 ## Interactive Session
@@ -88,16 +101,19 @@ tsvd --debug data.tsv
 Once you start tsvd, you'll see a prompt where you can type commands in natural language:
 
 ```
-Loaded sales.tsv (150 rows, 5 columns)
-
-user › Add a new column called "Total" that sums Price and Tax
+→ Loaded spreadsheet (150 rows, 5 columns) — working file: .tsvd-1234567890.tsv
+prompt › Add a new column called "Total" that sums Price and Tax
 ```
 
 `tsvd` will:
-1. Propose the changes and display a colored diff showing what will change
-2. Ask for your confirmation before saving
+1. Show the model's thinking (if extended thinking is enabled)
+2. Display used tools and explanation of it's changes
+3. Show a colored diff of the proposed changes
+4. Ask for your confirmation before applying changes to a working file
 
 To exit, press Enter on an empty line or press Ctrl+C.
+
+You will be prompted to save changes to the original file or a new file.
 
 ### Example Interactions
 
@@ -135,24 +151,30 @@ These limits ensure optimal performance and reasonable API token usage.
 
 ## How It Works
 
-1. **Load**: tsvd reads your TSV file and converts it to an internal table format
-2. **Convert**: The table is displayed to Claude as a markdown table with row numbers and column labels
-3. **Edit**: Claude uses two tools to make changes:
+1. **Load**: tsvd reads your TSV file (or stdin) and converts it to an internal table format
+2. **Convert**: The table is displayed to the AI model as a markdown table with row numbers and column labels
+3. **Edit**: The model uses several tools to make changes:
    - `str_replace`: For precise, surgical edits (must match exactly once)
    - `replace_all`: For major restructuring, sorting, or bulk changes
+   - `edit_cells`: For editing specific cells by coordinates
+   - `replace_area`: For replacing rectangular regions
 4. **Review**: You see a diff of all proposed changes
-5. **Apply**: If you approve, changes are saved to disk
+5. **Apply**: If you approve, changes are saved to a working file
+6. **Save**: On exit, you can save to the original file or a new location
 
 You exit tsvd by pressing Enter on an empty line or pressing Ctrl+C.
 
-## Debug Mode
+## Provider Support
 
-Enable debug mode with `--debug` or `-d` to see:
-- API request/response details
-- State file dumps (saved as `<filename>.tsv.state`)
-- Table dimension information
-- Tool execution details
+tsvd supports multiple AI providers:
 
-```bash
-tsvd --debug data.tsv
-```
+- **Anthropic** (Claude): Default when `ANTHROPIC_API_KEY` is set
+  - Supports extended thinking with the `claude-sonnet-4-5-20250929` model
+  - Uses prompt caching for better performance on large spreadsheets
+
+- **OpenRouter**: Use when `OPENROUTER_API_KEY` is set
+  - Access to many models including OpenAI, Anthropic via OpenRouter, and others
+  - Supports reasoning/thinking modes where available
+  - Specify with `--provider openrouter`
+
+The provider is auto-detected based on which API key is set. Use `--provider` to explicitly choose one when both keys are available.

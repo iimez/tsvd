@@ -1,0 +1,10 @@
+Product	Quantity	Price	Total	Tax Rate	Tax Amount	Final Price
+Laptop	2	899.99	=B2*C2	0.08	=D2*E2	=D2+F2
+Mouse	5	24.99	=B3*C3	0.08	=D3*E3	=D3+F3
+Keyboard	3	79.99	=B4*C4	0.08	=D4*E4	=D4+F4
+Monitor	1	299.99	=B5*C5	0.08	=D5*E5	=D5+F5
+Headphones	4	149.99	=B6*C6	0.08	=D6*E6	=D6+F6
+
+Subtotal				=SUM(D2:D6)
+Total Tax					=SUM(F2:F6)
+Grand Total						=SUM(G2:G6)
