@@ -1,17 +1,17 @@
 {
 	"languages": {
 		"TypeScript": {
-			"language_servers": ["!typescript-language-server", "deno"]
+			"language_servers": ["deno", "!typescript-language-server"]
 		},
 		"JavaScript": {
-			"language_servers": ["!typescript-language-server", "deno"]
+			"language_servers": ["deno", "!typescript-language-server"]
 		}
 	},
 	"lsp": {
 		"deno": {
 			"settings": {
 				"deno": {
-					"enable": true,
+					"enable": true
 				}
 			}
 		}

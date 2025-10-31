@@ -1,10 +1,12 @@
 {
+	"version": "0.1.0-rc.0",
 	"imports": {
 		"@cliffy/command": "jsr:@cliffy/command@1.0.0-rc.8",
 		"@cliffy/ansi": "jsr:@cliffy/ansi@1.0.0-rc.8",
 		"@cliffy/prompt": "jsr:@cliffy/prompt@1.0.0-rc.8",
 		"@ai-sdk/anthropic": "npm:@ai-sdk/anthropic@2.0.39",
 		"@openrouter/ai-sdk-provider": "npm:@openrouter/ai-sdk-provider@1.2.0",
+		"zod": "npm:zod@3.25.76",
 		"ai": "npm:ai@5.0.82"
 	},
 	"compilerOptions": {
@@ -22,13 +24,16 @@
 	"tasks": {
 		"check": "deno check **/*.ts",
 		"fmt": "deno fmt",
-		"lint": "deno lint"
+		"lint": "deno lint",
+		"compile": "deno compile --allow-read --allow-write --allow-env --allow-net --allow-run --output tsvd tsvd.ts"
 	},
 	"fmt": {
 		"useTabs": true,
 		"indentWidth": 4,
 		"semiColons": false,
-		"singleQuote": true
+		"singleQuote": true,
+		"proseWrap": "preserve",
+		"exclude": ["README.md"]
 	},
 	"lint": {
 		"rules": {
