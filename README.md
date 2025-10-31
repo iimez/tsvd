@@ -31,7 +31,7 @@ Note: There is currently no evaluation of cells and formulas going on, and no au
 1. Clone the repository:
 
    ```bash
-   git clone <repository-url>
+   git clone git@github.com:iimez/tsvd.git
    cd tsvd
    ```
 
